@@ -30,7 +30,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"gvisor.dev/gvisor/pkg/cleanup"
-	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -1147,24 +1146,20 @@ func TestSplitFSCheckpointRestore(t *testing.T) {
 
 	// Checkpoint running container with SplitFSCheckpoint: true.
 	checkpointOpts := sandbox.CheckpointOpts{
-		SplitFSCheckpointPaths: []checkpoint.ResourceID{{Path: "all-tmpfs"}},
+		SplitFSCheckpointPaths: []string{"fs=all-tmpfs"},
 	}
 	if err := cont.Checkpoint(conf, dir, checkpointOpts); err != nil {
 		t.Fatalf("error checkpointing container: %v", err)
 	}
 
-	// Verify that fs/ directory is created and contains the expected files.
-	fsDir := filepath.Join(dir, checkpointfiles.FSCheckpointDir)
-	if _, err := os.Stat(fsDir); os.IsNotExist(err) {
-		t.Fatalf("fs directory was not created")
-	}
+	// Verify that fs_* files are created in dir.
 	for _, name := range []string{
 		checkpointfiles.FSCheckpointManifestFileName,
 		checkpointfiles.FSCheckpointMultiTarFileName,
 		checkpointfiles.PagesFileName,
 		checkpointfiles.PagesMetadataFileName,
 	} {
-		p := filepath.Join(fsDir, name)
+		p := filepath.Join(dir, checkpointfiles.PrefixFileName("fs", name))
 		if _, err := os.Stat(p); os.IsNotExist(err) {
 			t.Errorf("expected file %q was not created", p)
 		}
@@ -1206,13 +1201,21 @@ func TestSplitFSCheckpointRestore(t *testing.T) {
 // filesystem checkpoint.
 const allTmpfs = "all-tmpfs"
 
-// fsCheckpointFiles are the files that make up the filesystem part of a split
-// checkpoint image. They are saved under checkpointfiles.FSCheckpointDir.
+// fsCheckpointFiles are the base filenames that make up the filesystem part of
+// a split checkpoint image.
 var fsCheckpointFiles = []string{
 	checkpointfiles.FSCheckpointManifestFileName,
 	checkpointfiles.FSCheckpointMultiTarFileName,
 	checkpointfiles.PagesFileName,
 	checkpointfiles.PagesMetadataFileName,
+}
+
+func prefixedFSCheckpointFiles(prefix string) []string {
+	var res []string
+	for _, name := range fsCheckpointFiles {
+		res = append(res, checkpointfiles.PrefixFileName(prefix, name))
+	}
+	return res
 }
 
 // sentryCheckpointFiles are the files that make up the Sentry part of a
@@ -1370,20 +1373,15 @@ func checkHostFilesAbsent(t *testing.T, paths ...string) {
 }
 
 // checkFSCheckpointFiles checks that the filesystem part of a split checkpoint
-// image was created inside checkpointDir and returns the directory holding it.
-func checkFSCheckpointFiles(t *testing.T, checkpointDir string) string {
+// image with the given prefix was created inside checkpointDir.
+func checkFSCheckpointFiles(t *testing.T, checkpointDir, prefix string) {
 	t.Helper()
-	fsDir := filepath.Join(checkpointDir, checkpointfiles.FSCheckpointDir)
-	if _, err := os.Stat(fsDir); err != nil {
-		t.Fatalf("filesystem checkpoint directory was not created: %v", err)
-	}
-	for _, name := range fsCheckpointFiles {
-		path := filepath.Join(fsDir, name)
+	for _, name := range prefixedFSCheckpointFiles(prefix) {
+		path := filepath.Join(checkpointDir, name)
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("expected file %q was not created: %v", path, err)
 		}
 	}
-	return fsDir
 }
 
 // copyCheckpointFiles copies names from srcDir into a new temporary directory
@@ -1448,7 +1446,7 @@ func TestPartialSplitFSCheckpointRestore(t *testing.T) {
 	// Checkpoint the running container with only tmpfsMount1 saved into the
 	// filesystem image.
 	checkpointOpts := sandbox.CheckpointOpts{
-		SplitFSCheckpointPaths: []checkpoint.ResourceID{{Path: tmpfsMount1}},
+		SplitFSCheckpointPaths: []string{"fs=" + tmpfsMount1},
 	}
 	if err := cont.Checkpoint(conf, checkpointDir, checkpointOpts); err != nil {
 		t.Fatalf("error checkpointing container: %v", err)
@@ -1501,15 +1499,15 @@ func TestSplitFSCheckpointRestoreOnlyFS(t *testing.T) {
 	waitForGuestFiles(t, conf, cont, guestFile)
 
 	checkpointOpts := sandbox.CheckpointOpts{
-		SplitFSCheckpointPaths: []checkpoint.ResourceID{{Path: allTmpfs}},
+		SplitFSCheckpointPaths: []string{"fs=" + allTmpfs},
 	}
 	if err := cont.Checkpoint(conf, checkpointDir, checkpointOpts); err != nil {
 		t.Fatalf("error checkpointing container: %v", err)
 	}
 
 	// Copy the filesystem image into a directory that holds nothing else.
-	fsDir := checkFSCheckpointFiles(t, checkpointDir)
-	onlyFSDir := copyCheckpointFiles(t, fsDir, "only-fs-dir", fsCheckpointFiles)
+	checkFSCheckpointFiles(t, checkpointDir, "fs")
+	onlyFSDir := copyCheckpointFiles(t, checkpointDir, "only-fs-dir", prefixedFSCheckpointFiles("fs"))
 
 	t.Run("StartFreshWithOnlyFS", func(t *testing.T) {
 		// The fresh container runs a different application and is started from
@@ -1540,6 +1538,19 @@ func TestSplitFSCheckpointRestoreOnlyFS(t *testing.T) {
 		})
 		if err := contRestore.Restore(conf, sentryOnlyDir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
 			t.Fatalf("error restoring container with isolated fs checkpoint: %v", err)
+		}
+
+		checkGuestFile(t, conf, contRestore, guestFile, "hello")
+	})
+
+	t.Run("RestoreWithExplicitPrefixPath", func(t *testing.T) {
+		sentryOnlyDir := copyCheckpointFiles(t, checkpointDir, "sentry-only-dir-explicit", sentryCheckpointFiles)
+
+		contRestore := newContainer(t, conf, spec, bundleDir, func(args *Args) {
+			args.FSRestoreImagePath = filepath.Join(onlyFSDir, "fs")
+		})
+		if err := contRestore.Restore(conf, sentryOnlyDir, false /* direct */, false /* background */, nil /* networkArgs */); err != nil {
+			t.Fatalf("error restoring container with explicit <dir>/<prefix> fs checkpoint: %v", err)
 		}
 
 		checkGuestFile(t, conf, contRestore, guestFile, "hello")
