@@ -328,7 +328,8 @@ func taskFromProcPIDFD(vfsfd *vfs.FileDescription) (*Task, error) {
 	}
 	t := i.TaskFromProcPIDInode()
 	if t == nil {
-		return nil, linuxerr.ESRCH
+		// Only /proc/[pid] itself is a pidfd, not the files under it.
+		return nil, linuxerr.EBADF
 	}
 	return t, nil
 }
