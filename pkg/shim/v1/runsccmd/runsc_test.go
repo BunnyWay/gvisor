@@ -17,12 +17,14 @@
 package runsccmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -83,5 +85,22 @@ exit 0
 	}
 	if got.Memory == nil || got.Memory.Limit == nil || *got.Memory.Limit != limit {
 		t.Fatalf("stdin resources: got %+v, want memory limit %d", got.Memory, limit)
+	}
+}
+
+func TestCommandWaitDelayUnblocksInheritedPipe(t *testing.T) {
+	old := waitDelay
+	waitDelay = 100 * time.Millisecond
+	t.Cleanup(func() { waitDelay = old })
+	fake := filepath.Join(t.TempDir(), "fake-runsc")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nsleep 60 &\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, _, err := cmdOutput((&Runsc{Command: fake}).command(context.Background()), false); err == nil {
+		t.Fatal("cmdOutput succeeded while a child retained its pipes")
+	}
+	if elapsed := time.Since(start); elapsed < waitDelay || elapsed > 2*time.Second {
+		t.Fatalf("cmdOutput returned after %v, want a bounded wait", elapsed)
 	}
 }
