@@ -21,12 +21,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 )
 
 // TestRunscUpdateCLI verifies Update runs the OCI update flow: JSON resources on
@@ -89,11 +92,44 @@ exit 0
 }
 
 func TestCommandWaitDelayUnblocksInheritedPipe(t *testing.T) {
+	if os.Getenv("RUNSC_PIPE_TEST_CHILD") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestCommandWaitDelayUnblocksInheritedPipe$")
+		cmd.Env = append(os.Environ(), "RUNSC_PIPE_TEST_CHILD=1")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("pipe test subprocess: %v\n%s", err, out)
+		}
+		return
+	}
+	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
+		t.Skipf("subreaper unavailable: %v", err)
+	}
 	old := waitDelay
 	waitDelay = 100 * time.Millisecond
 	t.Cleanup(func() { waitDelay = old })
 	fake := filepath.Join(t.TempDir(), "fake-runsc")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\nsleep 60 &\nexit 0\n"), 0o755); err != nil {
+	childFile := fake + ".child"
+	t.Cleanup(func() {
+		raw, err := os.ReadFile(childFile)
+		if err != nil {
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = unix.Kill(pid, unix.SIGKILL)
+		for {
+			_, err = unix.Wait4(pid, nil, 0, nil)
+			if err != unix.EINTR {
+				break
+			}
+		}
+		if err != nil {
+			t.Errorf("reap pipe-holder child: %v", err)
+		}
+	})
+	script := fmt.Sprintf("#!/bin/sh\nsleep 60 &\necho $! >%q\nexit 0\n", childFile)
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()

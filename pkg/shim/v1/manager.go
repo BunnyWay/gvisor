@@ -43,6 +43,8 @@ const (
 	oomScoreMax = -999
 )
 
+var stopRunscTimeout = 30 * time.Second
+
 // NewShimManager returns an implementation of the shim manager
 // using runsc.
 func NewShimManager(name string) shim.Manager {
@@ -188,6 +190,9 @@ func (m *manager) Start(ctx context.Context, id string, opts shim.StartOpts) (sh
 
 // Stop implements shim.Manager.Stop.
 func (manager) Stop(ctx context.Context, id string) (shim.StopStatus, error) {
+	ctx, cancel := context.WithTimeout(ctx, stopRunscTimeout)
+	defer cancel()
+
 	log.L.Debugf("StopShim, id: %v", id)
 	path, err := os.Getwd()
 	if err != nil {

@@ -25,15 +25,41 @@ import (
 
 	"github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/pkg/stdio"
+	runc "github.com/containerd/go-runc"
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
 )
 
+func testPidfd(t *testing.T, pid int) int {
+	t.Helper()
+	fd, err := unix.PidfdOpen(pid, 0)
+	if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		t.Skipf("pidfd unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("pidfd_open: %v", err)
+	}
+	if err := unix.PidfdSendSignal(fd, 0, nil, 0); err != nil {
+		_ = unix.Close(fd)
+		if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+			t.Skipf("pidfd signals unavailable: %v", err)
+		}
+		t.Fatalf("pidfd_send_signal: %v", err)
+	}
+	return fd
+}
+
+type testProcessMonitor struct{}
+
+func (testProcessMonitor) Subscribe() chan runc.Exit  { return make(chan runc.Exit) }
+func (testProcessMonitor) Unsubscribe(chan runc.Exit) {}
+
 func newWedgedInit(t *testing.T) *Init {
 	t.Helper()
-	old := runscTimeout
+	old, oldLong := runscTimeout, runscLongOperationTimeout
 	runscTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { runscTimeout = old })
+	runscLongOperationTimeout = runscTimeout
+	t.Cleanup(func() { runscTimeout, runscLongOperationTimeout = old, oldLong })
 	fake := filepath.Join(t.TempDir(), "fake-runsc")
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec >/dev/null 2>&1\nexec sleep 60\n"), 0o755); err != nil {
 		t.Fatalf("write fake runsc: %v", err)
@@ -71,6 +97,96 @@ func TestRuntimeCallsAreBounded(t *testing.T) {
 	}
 }
 
+func TestCreateWedgedRunscIsBounded(t *testing.T) {
+	p := newWedgedInit(t)
+	p.Bundle = t.TempDir()
+	t.Cleanup(p.closeIO)
+	start := time.Now()
+	if err := p.Create(context.Background(), &CreateConfig{ID: p.id, Bundle: p.Bundle}); err == nil {
+		t.Fatal("Create succeeded against a wedged runsc")
+	}
+	requireBounded(t, start)
+}
+
+func TestExecRuntimeCallsAreBounded(t *testing.T) {
+	for _, name := range []string{"Start", "Kill"} {
+		t.Run(name, func(t *testing.T) {
+			p := newWedgedInit(t)
+			p.Monitor = testProcessMonitor{}
+			e := &execProcess{parent: p, path: t.TempDir(), id: "exec", internalPid: 1, waitBlock: make(chan struct{})}
+			e.execState = &execCreatedState{p: e}
+			start := time.Now()
+			var err error
+			if name == "Start" {
+				err = e.Start(context.Background())
+			} else {
+				err = e.Kill(context.Background(), uint32(unix.SIGKILL), true)
+			}
+			if err == nil {
+				t.Fatalf("exec %s succeeded against a wedged runsc", name)
+			}
+			requireBounded(t, start)
+			_ = e.delete(context.Background())
+		})
+	}
+}
+
+func TestExecCanceledCallerDoesNotWaitBehindLock(t *testing.T) {
+	e := &execProcess{}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, call := range []func(context.Context) error{e.Start, e.Delete, func(ctx context.Context) error {
+		return e.Kill(ctx, uint32(unix.SIGKILL), true)
+	}} {
+		start := time.Now()
+		if err := call(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("exec error = %v, want cancellation", err)
+		}
+		requireBounded(t, start)
+	}
+}
+
+func TestExecDeleteBoundsIOWaitAndCanRetry(t *testing.T) {
+	_ = newWedgedInit(t)
+	e := &execProcess{}
+	e.execState = &execStoppedState{p: e}
+	e.wg.Add(1)
+	start := time.Now()
+	err := e.Delete(context.Background())
+	e.wg.Done()
+	if !errors.Is(err, errRunscTimeout) {
+		t.Fatalf("Delete error = %v, want shim timeout", err)
+	}
+	requireBounded(t, start)
+	if err := e.Delete(context.Background()); err != nil {
+		t.Fatalf("Delete retry: %v", err)
+	}
+}
+
+func TestDeleteClosesPidfdBeforeFailedUnmount(t *testing.T) {
+	p := newWedgedInit(t)
+	p.Sandbox = true
+	p.sandboxPidfd = testPidfd(t, os.Getpid())
+	t.Cleanup(p.closeSandboxPidfd)
+	p.initState = &stoppedState{process: p}
+	fake := filepath.Join(t.TempDir(), "successful-runsc")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p.runtime.Command = fake
+	old := unmountRootfs
+	unmountRootfs = func(string, int) error { return unix.EBUSY }
+	t.Cleanup(func() { unmountRootfs = old })
+	if err := p.Delete(context.Background()); !errors.Is(err, unix.EBUSY) {
+		t.Fatalf("Delete error = %v, want unmount failure", err)
+	}
+	if p.sandboxPidfd != -1 {
+		t.Fatal("successful runtime deletion retained its pidfd")
+	}
+}
+
 func TestCanceledCallerDoesNotWaitBehindContainerLock(t *testing.T) {
 	p := newWedgedInit(t)
 	p.mu.Lock()
@@ -101,10 +217,7 @@ func TestDeleteTimeoutKillsOnlyPinnedSandboxProcess(t *testing.T) {
 		_ = neighbor.Process.Kill()
 		_ = neighbor.Wait()
 	})
-	pidfd, err := unix.PidfdOpen(sandbox.Process.Pid, 0)
-	if err != nil {
-		t.Fatalf("pidfd_open: %v", err)
-	}
+	pidfd := testPidfd(t, sandbox.Process.Pid)
 
 	p := newWedgedInit(t)
 	p.Sandbox = true
@@ -137,10 +250,7 @@ func TestDeleteTimeoutBehindRuntimeLockKillsPinnedSandbox(t *testing.T) {
 		_ = sandbox.Process.Kill()
 		_ = sandbox.Wait()
 	})
-	pidfd, err := unix.PidfdOpen(sandbox.Process.Pid, 0)
-	if err != nil {
-		t.Fatalf("pidfd_open: %v", err)
-	}
+	pidfd := testPidfd(t, sandbox.Process.Pid)
 
 	p := newWedgedInit(t)
 	p.Sandbox = true
@@ -170,10 +280,7 @@ func TestDeleteTimeoutDoesNotKillAWorkloadProcess(t *testing.T) {
 		_ = process.Process.Kill()
 		_ = process.Wait()
 	})
-	pidfd, err := unix.PidfdOpen(process.Process.Pid, 0)
-	if err != nil {
-		t.Fatalf("pidfd_open: %v", err)
-	}
+	pidfd := testPidfd(t, process.Process.Pid)
 
 	p := newWedgedInit(t)
 	p.Sandbox = false
@@ -195,10 +302,7 @@ func TestExplicitSandboxKillTimeoutKillsPinnedSandbox(t *testing.T) {
 		_ = sandbox.Process.Kill()
 		_ = sandbox.Wait()
 	})
-	pidfd, err := unix.PidfdOpen(sandbox.Process.Pid, 0)
-	if err != nil {
-		t.Fatalf("pidfd_open: %v", err)
-	}
+	pidfd := testPidfd(t, sandbox.Process.Pid)
 
 	p := newWedgedInit(t)
 	p.Sandbox = true
@@ -225,10 +329,7 @@ func TestSandboxKillTimeoutDoesNotEscalateNonDestructiveSignal(t *testing.T) {
 		_ = sandbox.Process.Kill()
 		_ = sandbox.Wait()
 	})
-	pidfd, err := unix.PidfdOpen(sandbox.Process.Pid, 0)
-	if err != nil {
-		t.Fatalf("pidfd_open: %v", err)
-	}
+	pidfd := testPidfd(t, sandbox.Process.Pid)
 
 	p := newWedgedInit(t)
 	p.Sandbox = true
@@ -249,10 +350,7 @@ func TestAutomaticKillAllTimeoutDoesNotKillSandbox(t *testing.T) {
 		_ = sandbox.Process.Kill()
 		_ = sandbox.Wait()
 	})
-	pidfd, err := unix.PidfdOpen(sandbox.Process.Pid, 0)
-	if err != nil {
-		t.Fatalf("pidfd_open: %v", err)
-	}
+	pidfd := testPidfd(t, sandbox.Process.Pid)
 
 	p := newWedgedInit(t)
 	p.Sandbox = true
@@ -273,10 +371,7 @@ func TestDeleteCallerDeadlineDoesNotKillSandbox(t *testing.T) {
 		_ = sandbox.Process.Kill()
 		_ = sandbox.Wait()
 	})
-	pidfd, err := unix.PidfdOpen(sandbox.Process.Pid, 0)
-	if err != nil {
-		t.Fatalf("pidfd_open: %v", err)
-	}
+	pidfd := testPidfd(t, sandbox.Process.Pid)
 
 	p := newWedgedInit(t)
 	p.Sandbox = true

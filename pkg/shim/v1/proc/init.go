@@ -49,6 +49,7 @@ var (
 	runscTimeout              = 30 * time.Second
 	runscLongOperationTimeout = 5 * time.Minute
 	errRunscTimeout           = fmt.Errorf("runsc operation timed out: %w", context.DeadlineExceeded)
+	unmountRootfs             = mount.UnmountAll
 )
 
 // Init represents an initial process for a container.
@@ -128,6 +129,9 @@ func New(id string, runtime *runsccmd.Runsc, stdio stdio.Stdio) *Init {
 
 // Create the process with the provided config.
 func (p *Init) Create(ctx context.Context, r *CreateConfig) (err error) {
+	ctx, cancelRuntime := context.WithTimeoutCause(ctx, runscLongOperationTimeout, errRunscTimeout)
+	defer cancelRuntime()
+
 	var socket *runc.Socket
 	if r.Terminal {
 		if socket, err = runc.NewTempConsoleSocket(); err != nil {
@@ -212,13 +216,21 @@ func (p *Init) lockRuntime(parent context.Context) (context.Context, func(), err
 }
 
 func (p *Init) lockRuntimeFor(parent context.Context, timeout time.Duration) (context.Context, func(), error) {
+	return lockRuntimeFor(&p.mu, parent, timeout)
+}
+
+func lockRuntimeFor(mu *sync.Mutex, parent context.Context, timeout time.Duration) (context.Context, func(), error) {
 	ctx, cancel := context.WithTimeoutCause(parent, timeout, errRunscTimeout)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if p.mu.TryLock() {
+		if err := context.Cause(ctx); err != nil {
+			cancel()
+			return nil, nil, err
+		}
+		if mu.TryLock() {
 			return ctx, func() {
-				p.mu.Unlock()
+				mu.Unlock()
 				cancel()
 			}, nil
 		}
@@ -398,14 +410,14 @@ func (p *Init) delete(ctx context.Context) error {
 		}
 	}
 	p.closeIO()
-	if err2 := mount.UnmountAll(p.Rootfs, 0); err2 != nil {
+	if err == nil {
+		p.closeSandboxPidfd()
+	}
+	if err2 := unmountRootfs(p.Rootfs, 0); err2 != nil {
 		log.G(ctx).WithError(err2).Warn("failed to cleanup rootfs mount")
 		if err == nil {
 			err = fmt.Errorf("failed rootfs umount: %w", err2)
 		}
-	}
-	if err == nil {
-		p.closeSandboxPidfd()
 	}
 	return err
 }

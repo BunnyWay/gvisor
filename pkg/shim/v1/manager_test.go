@@ -17,12 +17,41 @@ package v1
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"gvisor.dev/gvisor/pkg/shim/v1/runsc"
 
 	typeurl "github.com/containerd/typeurl/v2"
 	"github.com/opencontainers/runtime-spec/specs-go/features"
 
 	"testing"
 )
+
+func TestManagerStopBoundsWedgedRuntime(t *testing.T) {
+	old := stopRunscTimeout
+	stopRunscTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { stopRunscTimeout = old })
+	dir := t.TempDir()
+	t.Chdir(dir)
+	fake := filepath.Join(dir, "fake-runsc")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec >/dev/null 2>&1\nexec sleep 60\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st := runsc.State{Options: runsc.Options{BinaryName: fake}}
+	if err := st.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := (manager{}).Stop(namespaces.WithNamespace(context.Background(), "test"), "test"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < stopRunscTimeout || elapsed > 2*time.Second {
+		t.Fatalf("Stop returned after %v, want bounded runtime timeout", elapsed)
+	}
+}
 
 // TestManagerInfo verifies that the Info() call returns the expected information
 // about the runtime.
