@@ -17,6 +17,7 @@ package v1
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -35,6 +36,7 @@ import (
 	"gvisor.dev/gvisor/pkg/shim/v1/proc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsc"
 	"gvisor.dev/gvisor/pkg/shim/v1/runsccmd"
+	"gvisor.dev/gvisor/pkg/shim/v1/utils"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
@@ -43,7 +45,10 @@ const (
 	oomScoreMax = -999
 )
 
-var stopRunscTimeout = 30 * time.Second
+var (
+	stopRunscTimeout = 30 * time.Second
+	unmountRootfs    = mount.UnmountAll
+)
 
 // NewShimManager returns an implementation of the shim manager
 // using runsc.
@@ -208,13 +213,22 @@ func (manager) Stop(ctx context.Context, id string) (shim.StopStatus, error) {
 	}
 	r := proc.NewRunsc(st.Options.Root, path, ns, st.Options.BinaryName, nil, nil)
 
+	var stopErr error
 	if err := r.Delete(ctx, id, &runsccmd.DeleteOpts{
 		Force: true,
 	}); err != nil {
-		log.L.Infof("failed to remove runsc container: %v", err)
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
+		stopErr = fmt.Errorf("delete runsc container: %w", err)
 	}
-	if err := mount.UnmountAll(st.Rootfs, 0); err != nil {
-		log.L.Infof("failed to cleanup rootfs mount: %v", err)
+	unmount, rootfs := unmountRootfs, st.Rootfs
+	var cleanup utils.Cleanup
+	if err := cleanup.Run(ctx, utils.CleanupLockPath(r.Root, id), func() error { return unmount(rootfs, 0) }); err != nil {
+		stopErr = errors.Join(stopErr, fmt.Errorf("cleanup rootfs mount: %w", err))
+	}
+	if stopErr != nil {
+		return shim.StopStatus{}, stopErr
 	}
 	return shim.StopStatus{
 		ExitedAt:   time.Now(),

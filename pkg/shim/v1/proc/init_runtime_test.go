@@ -22,6 +22,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -67,7 +69,7 @@ func newWedgedInit(t *testing.T) *Init {
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec >/dev/null 2>&1\nexec sleep 60\n"), 0o755); err != nil {
 		t.Fatalf("write fake runsc: %v", err)
 	}
-	p := New("test", &runsccmd.Runsc{Command: fake}, stdio.Stdio{})
+	p := New("test", &runsccmd.Runsc{Command: fake, Root: t.TempDir()}, stdio.Stdio{})
 	p.initState = &runningState{p: p}
 	return p
 }
@@ -614,3 +616,96 @@ func TestBackportStoppedMetadataKeepsDeleteRecovery(t *testing.T) {
 type backportAuditPlatform struct{ stdio.Platform }
 
 func (backportAuditPlatform) ShutdownConsole(context.Context, console.Console) error { return nil }
+
+func TestDeleteBoundsBlockedUnmountAndReusesWorker(t *testing.T) {
+	p := newWedgedInit(t)
+	p.Rootfs = t.TempDir()
+	p.initState = &stoppedState{process: p}
+	fake := filepath.Join(t.TempDir(), "successful-runsc")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p.runtime.Command = fake
+	old := unmountRootfs
+	release, finished := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	var finishOnce sync.Once
+	unmountRootfs = func(path string, flags int) error {
+		calls.Add(1)
+		defer finishOnce.Do(func() { close(finished) })
+		if path != p.Rootfs || flags != 0 {
+			return fmt.Errorf("unmount(%q, %d), want (%q, 0)", path, flags, p.Rootfs)
+		}
+		<-release
+		return nil
+	}
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(func() { unblock(); <-finished; unmountRootfs = old })
+	for range 2 {
+		start := time.Now()
+		if err := p.Delete(context.Background()); !errors.Is(err, errRunscTimeout) {
+			t.Fatalf("Delete error = %v, want bounded unmount failure", err)
+		}
+		requireBounded(t, start)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("Delete retries started %d blocked workers, want one", calls.Load())
+	}
+	unblock()
+	<-finished
+	if err := p.Delete(context.Background()); err != nil {
+		t.Fatalf("Delete retry after unmount recovery: %v", err)
+	}
+}
+
+func TestDeleteTimeoutAfterSuccessfulKill(t *testing.T) {
+	for _, sandboxTask := range []bool{true, false} {
+		t.Run(fmt.Sprintf("Sandbox=%t", sandboxTask), func(t *testing.T) {
+			p := newWedgedInit(t)
+			p.initState = &stoppedState{process: p}
+			p.Sandbox = sandboxTask
+			sandbox := exec.Command("sleep", "60")
+			if err := sandbox.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = sandbox.Process.Kill(); _ = sandbox.Wait() })
+			p.sandboxPidfd = testPidfd(t, sandbox.Process.Pid)
+			t.Cleanup(p.closeSandboxPidfd)
+			neighbor := exec.Command("sleep", "60")
+			if err := neighbor.Start(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = neighbor.Process.Kill(); _ = neighbor.Wait() })
+			dir := t.TempDir()
+			fake := filepath.Join(dir, "delete-wedged-runsc")
+			marker := filepath.Join(dir, "delete-reached")
+			script := "#!/bin/sh\nfor arg do\nif [ \"$arg\" = delete ]; then\necho reached > " + strconv.Quote(marker) + "\nexec >/dev/null 2>&1\nexec sleep 60\nfi\ndone\nexit 0\n"
+			if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			p.runtime.Command = fake
+			start := time.Now()
+			if err := p.Delete(context.Background()); err == nil {
+				t.Fatal("Delete succeeded against wedged delete command")
+			}
+			requireBounded(t, start)
+			if _, err := os.Stat(marker); err != nil {
+				t.Fatalf("successful kill never reached Delete: %v", err)
+			}
+			if sandboxTask {
+				done := make(chan error, 1)
+				go func() { done <- sandbox.Wait() }()
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("Delete timeout did not terminate its sandbox")
+				}
+			} else if err := sandbox.Process.Signal(unix.Signal(0)); err != nil {
+				t.Fatalf("workload Delete killed sandbox: %v", err)
+			}
+			if err := neighbor.Process.Signal(unix.Signal(0)); err != nil {
+				t.Fatalf("neighbor was affected: %v", err)
+			}
+		})
+	}
+}
