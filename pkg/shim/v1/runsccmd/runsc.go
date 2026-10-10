@@ -599,6 +599,7 @@ func (r *Runsc) command(context context.Context, args ...string) *exec.Cmd {
 		command = DefaultCommand
 	}
 	cmd := exec.CommandContext(context, command, append(r.args(), args...)...)
+	cmd.WaitDelay = waitDelay
 	cmd.SysProcAttr = &unix.SysProcAttr{
 		Setpgid: r.Setpgid,
 	}
@@ -608,6 +609,10 @@ func (r *Runsc) command(context context.Context, args ...string) *exec.Cmd {
 
 	return cmd
 }
+
+// waitDelay force-closes command pipes after a killed runsc exits. Without it,
+// a grandchild that inherited an fd can keep Wait blocked after the deadline.
+var waitDelay = 5 * time.Second
 
 func cmdOutput(cmd *exec.Cmd, combined bool) ([]byte, []byte, error) {
 	stdout := getBuf()
