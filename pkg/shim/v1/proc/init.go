@@ -96,6 +96,7 @@ type Init struct {
 	ioWaitOnce     sync.Once
 	ioDone         chan struct{}
 	ioCloseOnce    sync.Once
+	rootfsCleanup  utils.Cleanup
 }
 
 // NewRunsc returns a new runsc instance for a process.
@@ -460,7 +461,8 @@ func (p *Init) delete(ctx context.Context) error {
 	if err == nil {
 		p.closeSandboxPidfd()
 	}
-	if err2 := unmountRootfs(p.Rootfs, 0); err2 != nil {
+	unmount, rootfs := unmountRootfs, p.Rootfs
+	if err2 := p.rootfsCleanup.Run(ctx, utils.CleanupLockPath(p.runtime.Root, p.id), func() error { return unmount(rootfs, 0) }); err2 != nil {
 		log.G(ctx).WithError(err2).Warn("failed to cleanup rootfs mount")
 		if err == nil {
 			err = fmt.Errorf("failed rootfs umount: %w", err2)

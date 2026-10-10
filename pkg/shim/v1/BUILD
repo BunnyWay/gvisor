@@ -21,6 +21,7 @@ go_library(
         "//pkg/shim/v1/proc",
         "//pkg/shim/v1/runsc",
         "//pkg/shim/v1/runsccmd",
+        "//pkg/shim/v1/utils",
         "//pkg/sync",
         "//runsc/specutils",
         "@com_github_containerd_containerd_api//runtime/sandbox/v1:go_default_library",
@@ -50,5 +51,6 @@ go_test(
         "@com_github_containerd_containerd_v2//pkg/namespaces:go_default_library",
         "@com_github_containerd_typeurl_v2//:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go/features:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
