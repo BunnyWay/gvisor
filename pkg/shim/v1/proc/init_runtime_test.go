@@ -17,12 +17,15 @@ package proc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/containerd/console"
 	"github.com/containerd/containerd/v2/pkg/protobuf/types"
 	"github.com/containerd/containerd/v2/pkg/stdio"
 	runc "github.com/containerd/go-runc"
@@ -387,3 +390,227 @@ func TestDeleteCallerDeadlineDoesNotKillSandbox(t *testing.T) {
 	}
 	p.closeSandboxPidfd()
 }
+
+func TestMain(m *testing.M) {
+	if os.Getenv("GVISOR_SHIM_TEST_RUNTIME_HELPER") == "1" {
+		if filepath.Base(os.Args[0]) == "runsc-sandbox" {
+			gate := os.NewFile(3, "sandbox-gate")
+			token := make([]byte, 1)
+			if _, err := gate.Read(token); err == nil && token[0] == 'E' {
+				path, err := exec.LookPath("sleep")
+				if err != nil || unix.Exec(path, []string{"sleep", "60"}, os.Environ()) != nil {
+					os.Exit(2)
+				}
+			}
+			_ = gate.Close()
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
+
+func sandboxIdentityProcess(t *testing.T, bundle string, spoof bool) (*exec.Cmd, *os.File) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := exec.Command(exe, "--bundle="+bundle)
+	if spoof {
+		process = exec.Command("/bin/sh", "-c", "read token <&3", "--bundle="+bundle)
+	}
+	process.Args[0] = "runsc-sandbox"
+	process.ExtraFiles = []*os.File{r}
+	if err := process.Start(); err != nil {
+		r.Close()
+		w.Close()
+		t.Fatal(err)
+	}
+	r.Close()
+	t.Cleanup(func() {
+		_ = w.Close()
+		_ = process.Process.Kill()
+		_ = process.Wait()
+	})
+	return process, w
+}
+
+func TestCreatePinsOnlyMatchingSandbox(t *testing.T) {
+	probe := testPidfd(t, os.Getpid())
+	_ = unix.Close(probe)
+	for _, name := range []string{"Matching", "MatchingSymlink", "MatchingPATH", "WrongBundle", "UnrelatedProcess", "SpoofedExecutable", "FailedIO"} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("GVISOR_SHIM_TEST_RUNTIME_HELPER", "1")
+			p := newWedgedInit(t)
+			runscLongOperationTimeout = 5 * time.Second
+			p.Sandbox = true
+			p.Bundle = t.TempDir()
+			t.Cleanup(p.closeIO)
+			t.Cleanup(p.closeSandboxPidfd)
+			bundle := p.Bundle
+			if name == "WrongBundle" {
+				bundle = t.TempDir()
+			}
+			process, _ := sandboxIdentityProcess(t, bundle, name == "SpoofedExecutable")
+			pid := process.Process.Pid
+			if name == "UnrelatedProcess" {
+				pid = os.Getpid()
+			}
+			if err := os.WriteFile(filepath.Join(p.Bundle, "init.pid"), []byte(strconv.Itoa(pid)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			exe, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			p.runtime.Command = exe
+			if name == "MatchingSymlink" || name == "MatchingPATH" {
+				dir := t.TempDir()
+				alias := filepath.Join(dir, "test-runsc")
+				if err := os.Symlink(exe, alias); err != nil {
+					t.Fatal(err)
+				}
+				p.runtime.Command = alias
+				if name == "MatchingPATH" {
+					t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+					p.runtime.Command = "test-runsc"
+				}
+			}
+			cfg := &CreateConfig{ID: p.id, Bundle: p.Bundle}
+			if name == "FailedIO" {
+				cfg.Stdin = filepath.Join(t.TempDir(), "missing-fifo")
+			}
+			err = p.Create(context.Background(), cfg)
+			if name == "FailedIO" {
+				if err == nil {
+					t.Fatal("Create succeeded with missing stdin FIFO")
+				}
+			} else if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			want := name == "Matching" || name == "MatchingSymlink" || name == "MatchingPATH"
+			if got := p.sandboxPidfd >= 0; got != want {
+				t.Fatalf("Create retained pidfd = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestPinnedSandboxRemainsOwnedAcrossExec(t *testing.T) {
+	t.Setenv("GVISOR_SHIM_TEST_RUNTIME_HELPER", "1")
+	p := newWedgedInit(t)
+	runscLongOperationTimeout = 5 * time.Second
+	wedgedCommand := p.runtime.Command
+	p.Sandbox = true
+	p.Bundle = t.TempDir()
+	p.Platform = backportAuditPlatform{}
+	t.Cleanup(p.closeIO)
+	t.Cleanup(p.closeSandboxPidfd)
+	sandbox, gate := sandboxIdentityProcess(t, p.Bundle, false)
+	if err := os.WriteFile(filepath.Join(p.Bundle, "init.pid"), []byte(strconv.Itoa(sandbox.Process.Pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.runtime.Command = exe
+	if err := p.Create(context.Background(), &CreateConfig{ID: p.id, Bundle: p.Bundle}); err != nil {
+		t.Fatal(err)
+	}
+	if p.sandboxPidfd < 0 {
+		t.Fatal("Create did not retain the matching sandbox pidfd")
+	}
+	neighbor := exec.Command("sleep", "60")
+	if err := neighbor.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = neighbor.Process.Kill(); _ = neighbor.Wait() })
+	sleepPath, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sleepExe, err := os.Stat(sleepPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.Write([]byte{'E'}); err != nil {
+		t.Fatal(err)
+	}
+	changed := false
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		actual, err := os.Stat(fmt.Sprintf("/proc/%d/exe", p.pid))
+		if err == nil && os.SameFile(sleepExe, actual) {
+			changed = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !changed {
+		t.Fatal("sandbox did not exec sleep with its original PID")
+	}
+	poll := []unix.PollFd{{Fd: int32(p.sandboxPidfd), Events: unix.POLLIN}}
+	if n, err := unix.Poll(poll, 0); err != nil || n != 0 {
+		t.Fatalf("pidfd lost the live sandbox across exec: %d, %v", n, err)
+	}
+	p.SetExited(internalErrorCode)
+	p.runtime.Command = wedgedCommand
+	if err := p.Delete(context.Background()); err == nil {
+		t.Fatal("Delete succeeded against wedged runsc")
+	}
+	done := make(chan error, 1)
+	go func() { done <- sandbox.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("explicit Delete failed to terminate its pinned sandbox after exec")
+	}
+	if err := neighbor.Process.Signal(unix.Signal(0)); err != nil {
+		t.Fatalf("neighbor was affected by sandbox teardown: %v", err)
+	}
+}
+
+func TestBackportStoppedMetadataKeepsDeleteRecovery(t *testing.T) {
+	sandbox := exec.Command("sleep", "60")
+	if err := sandbox.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sandbox.Process.Kill(); _ = sandbox.Wait() })
+	p := newWedgedInit(t)
+	p.Sandbox = true
+	p.Platform = backportAuditPlatform{}
+	p.sandboxPidfd = testPidfd(t, sandbox.Process.Pid)
+	t.Cleanup(p.closeSandboxPidfd)
+	fd := p.sandboxPidfd
+	p.SetExited(internalErrorCode)
+	if p.sandboxPidfd != fd {
+		t.Fatal("stopped task metadata discarded the live sentry identity needed by Delete")
+	}
+	if err := sandbox.Process.Signal(unix.Signal(0)); err != nil {
+		t.Fatalf("sentry unexpectedly died at SetExited: %v", err)
+	}
+	if err := p.Delete(context.Background()); err == nil {
+		t.Fatal("Delete succeeded against wedged runsc")
+	}
+	if p.sandboxPidfd != -1 {
+		t.Fatal("escalation retained the pidfd")
+	}
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("pidfd after recovery: %v, want closed", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- sandbox.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Delete failed to terminate the live sentry after SetExited")
+	}
+}
+
+type backportAuditPlatform struct{ stdio.Platform }
+
+func (backportAuditPlatform) ShutdownConsole(context.Context, console.Console) error { return nil }

@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -165,6 +167,19 @@ func (p *Init) Create(ctx context.Context, r *CreateConfig) (err error) {
 	if err := p.runtime.Create(ctx, r.ID, r.Bundle, opts); err != nil {
 		return p.runtimeError(err, "OCI runtime create failed")
 	}
+	pid, err := runc.ReadPidFile(pidFile)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve OCI runtime container pid: %w", err)
+	}
+	p.pid = pid
+	if p.Sandbox {
+		p.pinSandboxPidfd(ctx)
+		defer func() {
+			if err != nil {
+				p.closeSandboxPidfd()
+			}
+		}()
+	}
 	if r.Stdin != "" {
 		sc, err := fifo.OpenFifo(context.Background(), r.Stdin, unix.O_WRONLY|unix.O_NONBLOCK, 0)
 		if err != nil {
@@ -190,22 +205,53 @@ func (p *Init) Create(ctx context.Context, r *CreateConfig) (err error) {
 			return fmt.Errorf("failed to start io pipe copy: %w", err)
 		}
 	}
-	pid, err := runc.ReadPidFile(pidFile)
+	return nil
+}
+
+func (p *Init) pinSandboxPidfd(ctx context.Context) {
+	fd, err := unix.PidfdOpen(p.pid, 0)
 	if err != nil {
-		return fmt.Errorf("failed to retrieve OCI runtime container pid: %w", err)
+		log.G(ctx).WithError(err).Warnf("Cannot pin sandbox process %d; timed-out sandbox termination will fail closed", p.pid)
+		return
 	}
-	p.pid = pid
-	if p.Sandbox {
-		pidfd, err := unix.PidfdOpen(pid, 0)
-		if err != nil {
-			log.G(ctx).WithError(err).Warnf("Cannot pin sandbox process %d; timed-out sandbox termination will fail closed", pid)
-		} else {
-			p.sandboxPidfdMu.Lock()
-			p.sandboxPidfd = pidfd
-			p.sandboxPidfdMu.Unlock()
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", p.pid))
+	args := strings.Split(string(cmdline), "\x00")
+	bundleArg := "--bundle=" + p.Bundle
+	matchingBundle := false
+	for _, arg := range args {
+		if arg == bundleArg {
+			matchingBundle = true
+			break
 		}
 	}
-	return nil
+	matchingExe := p.sandboxExecutableMatches()
+	poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	n, pollErr := unix.Poll(poll, 0)
+	if err != nil || pollErr != nil || n != 0 || filepath.Base(args[0]) != "runsc-sandbox" || !matchingBundle || !matchingExe {
+		_ = unix.Close(fd)
+		log.G(ctx).Warnf("Cannot verify sandbox process %d for container %q; timed-out sandbox termination will fail closed", p.pid, p.id)
+		return
+	}
+	p.sandboxPidfdMu.Lock()
+	p.sandboxPidfd = fd
+	p.sandboxPidfdMu.Unlock()
+}
+
+func (p *Init) sandboxExecutableMatches() bool {
+	command := p.runtime.Command
+	if command == "" {
+		command = runsccmd.DefaultCommand
+	}
+	path, err := exec.LookPath(command)
+	if err != nil {
+		return false
+	}
+	expected, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	actual, err := os.Stat(fmt.Sprintf("/proc/%d/exe", p.pid))
+	return err == nil && os.SameFile(expected, actual)
 }
 
 // lockRuntime gives the lock wait and the runsc call one shared deadline.
@@ -230,7 +276,7 @@ func lockRuntimeFor(mu *sync.Mutex, parent context.Context, timeout time.Duratio
 		}
 		if mu.TryLock() {
 			return ctx, func() {
-				mu.Unlock()
+				mu.Unlock() // +checklocksforce: acquired before returning this closure.
 				cancel()
 			}, nil
 		}
@@ -368,6 +414,7 @@ func (p *Init) setExited(status int) {
 	log.L.Debugf("Setting status: %d", status)
 	p.exited = time.Now()
 	p.status = status
+	// Retain the sentry pidfd for explicit Delete after a failed runtime wait.
 	p.Platform.ShutdownConsole(context.Background(), p.console)
 	close(p.waitBlock)
 }
