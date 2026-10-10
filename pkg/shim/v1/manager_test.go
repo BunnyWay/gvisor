@@ -17,8 +17,12 @@ package v1
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -40,13 +44,17 @@ func TestManagerStopBoundsWedgedRuntime(t *testing.T) {
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec >/dev/null 2>&1\nexec sleep 60\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	st := runsc.State{Options: runsc.Options{BinaryName: fake}}
+	st := runsc.State{Options: runsc.Options{BinaryName: fake, Root: dir}}
 	if err := st.Save(dir); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	if _, err := (manager{}).Stop(namespaces.WithNamespace(context.Background(), "test"), "test"); err != nil {
-		t.Fatalf("Stop: %v", err)
+	status, err := (&manager{}).Stop(namespaces.WithNamespace(context.Background(), "test"), "test")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop error = %v, want deadline failure", err)
+	}
+	if !status.ExitedAt.IsZero() || status.ExitStatus != 0 {
+		t.Fatalf("failed Stop reported success: %+v", status)
 	}
 	if elapsed := time.Since(start); elapsed < stopRunscTimeout || elapsed > 2*time.Second {
 		t.Fatalf("Stop returned after %v, want bounded runtime timeout", elapsed)
@@ -78,4 +86,55 @@ func TestManagerInfo(t *testing.T) {
 		t.Fatalf("Decoded features is type %T, want *features.Features", decoded)
 	}
 
+}
+
+func TestManagerStopBoundsBlockedUnmountAndReportsFailure(t *testing.T) {
+	oldTimeout, oldUnmount := stopRunscTimeout, unmountRootfs
+	stopRunscTimeout = 200 * time.Millisecond
+	dir := t.TempDir()
+	t.Chdir(dir)
+	fake := filepath.Join(dir, "successful-runsc")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st := runsc.State{Options: runsc.Options{BinaryName: fake, Root: dir}, Rootfs: dir}
+	if err := st.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	release, finished := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	var finishOnce sync.Once
+	unmountRootfs = func(path string, flags int) error {
+		calls.Add(1)
+		defer finishOnce.Do(func() { close(finished) })
+		if path != dir || flags != 0 {
+			return fmt.Errorf("unmount(%q, %d), want (%q, 0)", path, flags, dir)
+		}
+		<-release
+		return nil
+	}
+	unblock := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(func() { unblock(); <-finished; stopRunscTimeout, unmountRootfs = oldTimeout, oldUnmount })
+	ctx := namespaces.WithNamespace(context.Background(), "test")
+	for range 2 {
+		start := time.Now()
+		status, err := (&manager{}).Stop(ctx, "test")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Stop error = %v, want unmount timeout", err)
+		}
+		if !status.ExitedAt.IsZero() || status.ExitStatus != 0 {
+			t.Fatalf("failed Stop reported success: %+v", status)
+		}
+		if time.Since(start) > 2*time.Second {
+			t.Fatal("Stop waited indefinitely for unmount")
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("Stop retries started %d blocked workers, want one", calls.Load())
+	}
+	unblock()
+	<-finished
+	if _, err := (&manager{}).Stop(ctx, "test"); err != nil {
+		t.Fatalf("Stop retry after unmount recovery: %v", err)
+	}
 }
